@@ -1,18 +1,16 @@
 use deku::prelude::*;
-use std::time::Duration;
-use std::net::Ipv4Addr;
 use std::io::Write;
-
 use std::net::IpAddr;
-use std::net::UdpSocket;
 use std::net::SocketAddr;
+use std::net::UdpSocket;
+use std::time::Duration;
 
 const CMD_1TEG_GET_UDP_INFO: u16 = 0x0b;
 const CMD_1TEG_SET_UDP_INFO: u16 = 0x0d;
 const CMD_2TEG_GET_STREAM: u16 = 0x01;
 const CMD_2TEG_IMAGE_DATA: u16 = 0x03;
 
-const TTEG_CMD_EXTERNAL_IPS_UPDATE_RESPONSE: u8 = 0x01;
+//const TTEG_CMD_EXTERNAL_IPS_UPDATE_RESPONSE: u8 = 0x01;
 //const TTEG_CMD_GET_UDP_INFO: u16 = 0x0c;
 
 
@@ -180,18 +178,53 @@ fn now() -> u64 {
 }
 
 
-fn hex(buf: &[u8]) -> String
+fn hex2(buf: &[u8]) -> String
 {
-    let mut out = Vec::new();
-    hxdmp::hexdump(buf, &mut out);
-    String::from_utf8_lossy(&out).to_string()
+    let mut s = String::new();
+    for i in buf {
+        use std::fmt::Write;
+        write!(&mut s, "{:02x}", i);
+    }
+    s
+}
+
+
+struct FrameBuilder {
+    pieces: Vec<Option<Vec<u8>>>,
+}
+
+
+impl FrameBuilder {
+    fn new() -> Self {
+        Self { pieces: Vec::new() }
+    }
+
+    fn add_piece(&mut self, pkt_id: u16, buf: &[u8]) {
+        if self.pieces.len() <= (pkt_id as usize) {
+            self.pieces.resize(pkt_id as usize + 1, None);
+        }
+        self.pieces[pkt_id as usize] = Some(buf.to_vec());
+    }
+
+    fn finalize(&mut self) -> Option<Vec<u8>> {
+        let out = match self.pieces.iter().any(|ov| matches!(ov, None)) {
+            true => None,
+            false => Some(self.pieces.iter().flatten().flatten().map(|c| *c).collect())
+        };
+        self.pieces.clear();
+        out
+    }
 }
 
 
 fn main() -> Result<(), std::io::Error> {
     let args: Vec<_> = std::env::args().collect();
-    let dst_addr = args[1].as_str();
+    if args.len() != 2 {
+        eprintln!("Usage: chinesium <cam_ip_addr>");
+        std::process::exit(1);
+    }
 
+    let dst_addr = args[1].as_str();
     let sock = UdpSocket::bind("0.0.0.0:0")?;
     sock.connect((dst_addr, 10104))?;
     sock.send(&TGetUDPInfoPkt::new().to_bytes()?)?;
@@ -209,22 +242,21 @@ fn main() -> Result<(), std::io::Error> {
 
     let my_addr = sock.local_addr()?;
     sock.send(&TSetUDPInfo::new(&my_addr).to_bytes()?)?;
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    std::thread::sleep(std::time::Duration::from_millis(20));
     sock.send(&TSetUDPInfo::new(&my_addr).to_bytes()?)?;
 
-    let TIMAGE_DATA_LEN = sizeof::<TImageData>();
+    let timage_data_len = sizeof::<TImageData>();
 
     let mut start_time = 0;
     let mut frames_received = 0;
+    let mut frames_dropped = 0;
 
-    let mut frame_buf_cohesive = false;
-    let mut frame_buf_last_idx = 0;
-    let mut frame_buf = Vec::new();
+    let mut builder = FrameBuilder::new();
     let mut last_get_stream = 0;
 
     loop {
         if (now() - last_get_stream) > 2000 {
-            eprintln!("HEARTBEAT");
+            eprintln!("Send heartbeat");
             sock.send(&TGetStream::new().to_bytes()?)?;
             //std::thread::sleep(std::time::Duration::from_millis(20));
             sock.send(&TGetStream::new().to_bytes()?)?;
@@ -235,67 +267,55 @@ fn main() -> Result<(), std::io::Error> {
             Ok(len) => {
                 let (_, header) = TTEGHeader::from_bytes((&buf, 0))?;
                 match header.as_tuple() {
-                    (1, 14, _) => {
-                        eprintln!("received (1, 14)");
-                    },
-                    (2, 1, _) => {
-                        eprintln!("received (1, 1)");
-                    },
-                    (2, 2, _) => {
-                        eprintln!("received (1, 2)");
-                    },
                     (2, CMD_2TEG_IMAGE_DATA, _) => {
-                        let ((rem, _), idata) = TImageData::from_bytes((&buf, 0))?;
-                        eprintln!("Video: frame={}, pkt={}, len={}",
+                        let (_, idata) = TImageData::from_bytes((&buf, 0))?;
+                        eprintln!("Recv Video frame={}, pkt={}, len={}",
                                  idata.frame_index,
                                  idata.pkt_index,
                                  idata.image_data_len);
 
                         if idata.pkt_index == 0 {
-                            if frame_buf_cohesive {
-                                // emit
-                                frames_received += 1;
-                                if start_time == 0 {
-                                    start_time = now();
-                                } else {
-                                    let ms = now() - start_time;
-                                    let secs = match ms / 1000 {
-                                        0 => 1.0,
-                                        _ => ms as f64 / 1000.0
-                                    };
-                                    eprintln!("EMIT, fps = {}", frames_received as f64 / secs);
+                            match builder.finalize() {
+                                None => {
+                                    eprintln!("dropped frame");
+                                    frames_dropped += 1;
+                                },
+                                Some(v) => {
+                                    // emit
+                                    frames_received += 1;
+                                    if start_time == 0 {
+                                        start_time = now();
+                                    } else {
+                                        let ms = now() - start_time;
+                                        let secs = match ms / 1000 {
+                                            0 => 1.0,
+                                            _ => ms as f64 / 1000.0
+                                        };
+                                        eprintln!("EMIT, fps={}, dropped={}, received={}",
+                                                  (frames_dropped+frames_received) as f64 / secs,
+                                                  frames_dropped, frames_received);
+                                    }
+                                    std::io::stdout().write_all(&v)?;
+                                    std::io::stdout().flush()?;
                                 }
-                                std::io::stdout().write_all(&frame_buf)?;
-                                std::io::stdout().flush()?;
-                            }
-                            frame_buf.clear();
-                            frame_buf_cohesive = true;
-                        }
-                        if frame_buf.len() > 0 {
-                            if frame_buf_last_idx != (idata.pkt_index - 1) {
-                                eprintln!("dropped frame");
-                                frame_buf_cohesive = false;
                             }
                         }
-                        let start = (idata.header.data_len as usize - 16 - idata.image_data_len as usize) + TIMAGE_DATA_LEN;
+                        let start = (idata.header.data_len as usize - 16 - idata.image_data_len as usize) + timage_data_len;
                         let rem = &buf[start..start+idata.image_data_len as usize];
-
-                        frame_buf.extend_from_slice(rem);
-                        frame_buf_last_idx = idata.pkt_index;
+                        builder.add_piece(idata.pkt_index, rem);
                     },
                     _ => {
-                        eprintln!("{:?}", header);
-                        eprintln!("{}", hex(&buf[..len]));
-                    }
+                        eprintln!("Recv ({}, {}, {}) -> {}",
+                                  header.version(), header.cmd,
+                                  header.data_len, hex2(&buf[..len]));
+                    },
                 }
             },
-            Err(e) => {
+            Err(_) => {
                 //return Err(e);
                 //eprintln!("sleep");
                 //std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
     }
-
-    Ok(())
 }
