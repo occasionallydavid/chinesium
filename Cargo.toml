@@ -1,0 +1,8 @@
+[package]
+name = "chinesium"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+deku = { version = "0.18.1", features = ["alloc", "std"] }
+hxdmp = "0.2.1"
