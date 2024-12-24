@@ -1,9 +1,8 @@
 use deku::prelude::*;
-use std::io::Write;
 use std::net::IpAddr;
 use std::net::SocketAddr;
-use std::net::UdpSocket;
-use std::time::Duration;
+use tokio::net::UdpSocket;
+
 
 const CMD_1TEG_GET_UDP_INFO: u16 = 0x0b;
 const CMD_1TEG_UDP_INFO_RESP: u16 = 0x0c;
@@ -56,10 +55,6 @@ impl TTEGHeader {
             [0x32, 0x54, 0x45, 0x47] => 2,
             _ => panic!()
         }
-    }
-
-    fn as_tuple(&self) -> (u8, u16, u16) {
-        (self.version(), self.cmd, self.data_len)
     }
 }
 
@@ -244,7 +239,23 @@ fn parse_frame(buf: &[u8]) -> Result<Frame, std::io::Error> {
 }
 
 
-fn main() -> Result<(), std::io::Error> {
+fn timeout_ms<F>(ms: u64, future: F)
+    -> tokio::time::Timeout<F::IntoFuture>
+where
+    F: std::future::IntoFuture
+{
+    tokio::time::timeout(
+        std::time::Duration::from_millis(ms),
+        future
+    )
+}
+
+
+async fn camera_main(
+    tx: tokio::sync::broadcast::Sender<Vec<u8>>
+)
+    -> Result<(), std::io::Error>
+{
     let args: Vec<_> = std::env::args().collect();
     if args.len() != 2 {
         eprintln!("Usage: chinesium <cam_ip_addr>");
@@ -252,25 +263,23 @@ fn main() -> Result<(), std::io::Error> {
     }
 
     let dst_addr = args[1].as_str();
-    let sock = UdpSocket::bind("0.0.0.0:0")?;
-    sock.connect((dst_addr, 10104))?;
-    sock.send(&TGetUDPInfoPkt::new().to_bytes()?)?;
+    let sock = UdpSocket::bind("0.0.0.0:0").await?;
+    sock.connect((dst_addr, 10104)).await?;
+    sock.send(&TGetUDPInfoPkt::new().to_bytes()?).await?;
 
     let mut buf = [0; 4096];
 
-    sock.set_read_timeout(Some(Duration::from_millis(1000)))?;
-    sock.recv(&mut buf)?;
+    timeout_ms(1000, sock.recv(&mut buf)).await??;
 
     let udp_info: TGetUDPInfo = from_bytes(&buf)?;
     eprintln!("{:?}", udp_info);
 
-    sock.set_read_timeout(Some(Duration::from_millis(100)))?;
-    sock.connect((dst_addr, udp_info.udp_info.udp_port))?;
+    sock.connect((dst_addr, udp_info.udp_info.udp_port)).await?;
 
     let my_addr = sock.local_addr()?;
-    sock.send(&TSetUDPInfo::new(&my_addr).to_bytes()?)?;
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    sock.send(&TSetUDPInfo::new(&my_addr).to_bytes()?)?;
+    sock.send(&TSetUDPInfo::new(&my_addr).to_bytes()?).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    sock.send(&TSetUDPInfo::new(&my_addr).to_bytes()?).await?;
 
     let timage_data_len = sizeof::<TImageData>();
 
@@ -284,15 +293,15 @@ fn main() -> Result<(), std::io::Error> {
     loop {
         if (now() - last_get_stream) > 2000 {
             eprintln!("Send heartbeat");
-            sock.send(&TGetStream::new().to_bytes()?)?;
+            sock.send(&TGetStream::new().to_bytes()?).await?;
             //std::thread::sleep(std::time::Duration::from_millis(20));
-            sock.send(&TGetStream::new().to_bytes()?)?;
+            sock.send(&TGetStream::new().to_bytes()?).await?;
             last_get_stream = now();
         }
 
-        let len = match sock.recv(&mut buf) {
-            Ok(len) => len,
-            Err(_) => continue
+        let len = match timeout_ms(100, sock.recv(&mut buf)).await {
+            Ok(Ok(len)) => len,
+            _ => continue,
         };
 
         match parse_frame(&buf[..len])? {
@@ -329,8 +338,10 @@ fn main() -> Result<(), std::io::Error> {
                                           (frames_dropped+frames_received) as f64 / secs,
                                           frames_dropped, frames_received);
                             }
-                            std::io::stdout().write_all(&v)?;
-                            std::io::stdout().flush()?;
+                            match tx.send(v) {
+                                Ok(count) => eprintln!("published frame to {} subscribers", count),
+                                Err(e) => eprintln!("publish fail: {:?}", e.to_string())
+                            }
                         }
                     }
                 }
@@ -341,4 +352,42 @@ fn main() -> Result<(), std::io::Error> {
             },
         }
     }
+}
+
+
+async fn web_main(tx: tokio::sync::broadcast::Sender<Vec<u8>>)
+    -> Result<(), std::io::Error>
+{
+    use axum::body::Body;
+    use tokio_stream::wrappers::BroadcastStream;
+
+    let app = axum::Router::new()
+        .route("/", axum::routing::get(|| async {
+            axum::response::Html(include_str!("index.html"))
+        }))
+        .route("/cam", axum::routing::get(|| async move {
+            axum::response::Response::builder()
+                .status(200)
+                .header("Content-Type", "video/x-motion-jpeg")
+                .body(Body::from_stream(BroadcastStream::new(tx.subscribe())))
+                .unwrap()
+        }));
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+        .await
+        .unwrap();
+
+    axum::serve(listener, app).await.unwrap();
+    Ok(())
+}
+
+
+#[tokio::main(flavor="current_thread")]
+async fn main() -> Result<(), std::io::Error> {
+    let (tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(40);
+
+    let cam_main = tokio::spawn(camera_main(tx.clone()));
+    let web_main = tokio::spawn(web_main(tx.clone()));
+    cam_main.await?.unwrap();
+    web_main.await?
 }

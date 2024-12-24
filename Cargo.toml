@@ -4,4 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+axum = "0.7.9"
 deku = { version = "0.18.1", features = ["alloc", "std"] }
+tokio = { version = "1.42.0", features = ["macros", "net", "rt", "time"] }
+tokio-stream = { version = "0.1.17", features = ["sync"] }

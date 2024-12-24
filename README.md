@@ -37,7 +37,9 @@ This device is characterized by:
    Internet access
 3. Do not set a password in IWFCam
 4. Find the MAC address from your AP and assign it a static IP address, like `10.10.1.30`
-5. `cargo run 10.10.1.30 | ffplay -probesize 32 -f mjpeg -`
+5. `cargo run 10.10.1.30`
+6. `ffplay -probesize 32 -f mjpeg http://localhost:3000/cam`
+7. Minimal player UI available on http://localhost:3000/
 
 
 ## Notes
