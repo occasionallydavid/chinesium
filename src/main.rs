@@ -6,18 +6,25 @@ use std::net::UdpSocket;
 use std::time::Duration;
 
 const CMD_1TEG_GET_UDP_INFO: u16 = 0x0b;
+const CMD_1TEG_UDP_INFO_RESP: u16 = 0x0c;
 const CMD_1TEG_SET_UDP_INFO: u16 = 0x0d;
 const CMD_2TEG_GET_STREAM: u16 = 0x01;
 const CMD_2TEG_IMAGE_DATA: u16 = 0x03;
 
 //const TTEG_CMD_EXTERNAL_IPS_UPDATE_RESPONSE: u8 = 0x01;
-//const TTEG_CMD_GET_UDP_INFO: u16 = 0x0c;
 
 
 fn sizeof<T>() -> usize
     where T: Default + deku::DekuContainerWrite
 {
     T::default().to_bytes().unwrap().len()
+}
+
+
+fn from_bytes<'a, T>(buf: &'a [u8]) -> Result<T, std::io::Error>
+    where T: deku::DekuContainerRead<'a>
+{
+    Ok(T::from_bytes((buf, 0))?.1)
 }
 
 
@@ -183,7 +190,7 @@ fn hex2(buf: &[u8]) -> String
     let mut s = String::new();
     for i in buf {
         use std::fmt::Write;
-        write!(&mut s, "{:02x}", i);
+        write!(&mut s, "{:02x}", i).expect("could not write");
     }
     s
 }
@@ -207,13 +214,33 @@ impl FrameBuilder {
     }
 
     fn finalize(&mut self) -> Option<Vec<u8>> {
-        let out = match self.pieces.iter().any(|ov| matches!(ov, None)) {
+        let out = match
+            self.pieces.iter().any(|ov| matches!(ov, None)) ||
+            self.pieces.is_empty()
+        {
             true => None,
             false => Some(self.pieces.iter().flatten().flatten().map(|c| *c).collect())
         };
         self.pieces.clear();
         out
     }
+}
+
+
+enum Frame {
+    UdpInfoResp(TGetUDPInfo),
+    ImageData(TImageData),
+    Unknown(TTEGHeader),
+}
+
+
+fn parse_frame(buf: &[u8]) -> Result<Frame, std::io::Error> {
+    let (_, header) = TTEGHeader::from_bytes((buf, 0))?;
+    Ok(match (header.version(), header.cmd) {
+        (1, CMD_1TEG_UDP_INFO_RESP) => Frame::UdpInfoResp(from_bytes(buf)?),
+        (2, CMD_2TEG_IMAGE_DATA) => Frame::ImageData(from_bytes(buf)?),
+        _ => Frame::Unknown(header),
+    })
 }
 
 
@@ -234,7 +261,7 @@ fn main() -> Result<(), std::io::Error> {
     sock.set_read_timeout(Some(Duration::from_millis(1000)))?;
     sock.recv(&mut buf)?;
 
-    let (_, udp_info) = TGetUDPInfo::from_bytes((&buf, 0))?;
+    let udp_info: TGetUDPInfo = from_bytes(&buf)?;
     eprintln!("{:?}", udp_info);
 
     sock.set_read_timeout(Some(Duration::from_millis(100)))?;
@@ -263,59 +290,55 @@ fn main() -> Result<(), std::io::Error> {
             last_get_stream = now();
         }
 
-        match sock.recv(&mut buf) {
-            Ok(len) => {
-                let (_, header) = TTEGHeader::from_bytes((&buf, 0))?;
-                match header.as_tuple() {
-                    (2, CMD_2TEG_IMAGE_DATA, _) => {
-                        let (_, idata) = TImageData::from_bytes((&buf, 0))?;
-                        eprintln!("Recv Video frame={}, pkt={}, len={}",
-                                 idata.frame_index,
-                                 idata.pkt_index,
-                                 idata.image_data_len);
+        let len = match sock.recv(&mut buf) {
+            Ok(len) => len,
+            Err(_) => continue
+        };
 
-                        if idata.pkt_index == 0 {
-                            match builder.finalize() {
-                                None => {
-                                    eprintln!("dropped frame");
-                                    frames_dropped += 1;
-                                },
-                                Some(v) => {
-                                    // emit
-                                    frames_received += 1;
-                                    if start_time == 0 {
-                                        start_time = now();
-                                    } else {
-                                        let ms = now() - start_time;
-                                        let secs = match ms / 1000 {
-                                            0 => 1.0,
-                                            _ => ms as f64 / 1000.0
-                                        };
-                                        eprintln!("EMIT, fps={}, dropped={}, received={}",
-                                                  (frames_dropped+frames_received) as f64 / secs,
-                                                  frames_dropped, frames_received);
-                                    }
-                                    std::io::stdout().write_all(&v)?;
-                                    std::io::stdout().flush()?;
-                                }
-                            }
-                        }
-                        let start = (idata.header.data_len as usize - 16 - idata.image_data_len as usize) + timage_data_len;
-                        let rem = &buf[start..start+idata.image_data_len as usize];
-                        builder.add_piece(idata.pkt_index, rem);
-                    },
-                    _ => {
-                        eprintln!("Recv ({}, {}, {}) -> {}",
-                                  header.version(), header.cmd,
-                                  header.data_len, hex2(&buf[..len]));
-                    },
-                }
-            },
-            Err(_) => {
-                //return Err(e);
-                //eprintln!("sleep");
-                //std::thread::sleep(std::time::Duration::from_millis(10));
+        match parse_frame(&buf[..len])? {
+            Frame::Unknown(header) => {
+                eprintln!("Recv ({}, {}, {}) -> {}",
+                          header.version(), header.cmd,
+                          header.data_len, hex2(&buf[..len]));
             }
+            Frame::UdpInfoResp(_) => {},
+            Frame::ImageData(idata) => {
+                eprintln!("Recv Video frame={}, pkt={}, len={}",
+                         idata.frame_index,
+                         idata.pkt_index,
+                         idata.image_data_len);
+
+                if idata.pkt_index == 0 {
+                    match builder.finalize() {
+                        None => {
+                            eprintln!("dropped frame");
+                            frames_dropped += 1;
+                        },
+                        Some(v) => {
+                            // emit
+                            frames_received += 1;
+                            if start_time == 0 {
+                                start_time = now();
+                            } else {
+                                let ms = now() - start_time;
+                                let secs = match ms / 1000 {
+                                    0 => 1.0,
+                                    _ => ms as f64 / 1000.0
+                                };
+                                eprintln!("EMIT, fps={}, dropped={}, received={}",
+                                          (frames_dropped+frames_received) as f64 / secs,
+                                          frames_dropped, frames_received);
+                            }
+                            std::io::stdout().write_all(&v)?;
+                            std::io::stdout().flush()?;
+                        }
+                    }
+                }
+
+                let start = (idata.header.data_len as usize - 16 - idata.image_data_len as usize) + timage_data_len;
+                let rem = &buf[start..start+idata.image_data_len as usize];
+                builder.add_piece(idata.pkt_index, rem);
+            },
         }
     }
 }
