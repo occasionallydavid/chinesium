@@ -40,7 +40,8 @@ This device is characterized by:
 4. Find the MAC address from your AP and assign it a static IP address, like `10.10.1.30`
 5. `cargo run 10.10.1.30`
 6. `ffplay -probesize 32 -f mjpeg http://localhost:3000/cam`
-7. Minimal player UI available on http://localhost:3000/
+7. `curl -sS http://localhost:3000/audio | sox -t ima -r 8000 - -b 16 -t wav - | ffplay -probesize 32 -f wav -` (audio is WIP)
+8. Minimal player UI available on http://localhost:3000/
 
 
 ## Notes
