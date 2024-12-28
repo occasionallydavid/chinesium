@@ -81,7 +81,7 @@ Internet access.
 * https://github.com/UND-ARC/IPCam/tree/master -- reversing project potentially for same cam
 * http://hasecurity.com/HL_support_sdks.aspx -- possible SDK download
 * https://apkpure.com/developer/gang.zhang?page=1 -- huge number of cam apps by IWFcam author
-
+* https://github.com/DavidVentura/cam-reverse different implementation for different cameras
 
 ### Other Brands
 

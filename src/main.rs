@@ -1,16 +1,19 @@
 use deku::prelude::*;
+use axum::body::Body;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio::sync::broadcast::Sender;
 
 
 const CMD_1TEG_DEVICE_CLOSED: u16 = 0x10; // data_len = 0x14 all zeroes
 const CMD_1TEG_APP_HEARTBEAT: u16 = 0x03;
-const CMD_1TEG_GET_UDP_INFO: u16 = 0x0b;
-const CMD_1TEG_UDP_INFO_RESP: u16 = 0x0c;
-const CMD_1TEG_SET_UDP_INFO: u16 = 0x0d;
+const CMD_1TEG_PORT_REQUEST: u16 = 0x0b;
+const CMD_1TEG_PORT_RESPONSE: u16 = 0x0c;
+const CMD_1TEG_LOGIN_REQUEST: u16 = 0x0d;
 const CMD_2TEG_PPP_CONTROL_CMD : u16 = 0x01;
-const CMD_2TEG_IMAGE_DATA: u16 = 0x03;
+const CMD_2TEG_MEDIA_FRAME: u16 = 0x03;
 const CMD_2TEG_MAYBE_SOUND: u16 = 0x04;
 
 //const TTEG_CMD_EXTERNAL_IPS_UPDATE_RESPONSE: u8 = 0x01;
@@ -87,7 +90,7 @@ impl TUDPInfo {
 
 
 #[derive(Debug, PartialEq, DekuRead, DekuWrite)]
-pub struct TGetUDPInfo {
+pub struct PortResponse {
     header: TTEGHeader,
     unknown_1: u32,
     unknown_2: u32,
@@ -98,7 +101,7 @@ pub struct TGetUDPInfo {
 
 
 #[derive(Debug, PartialEq, DekuRead, DekuWrite)]
-struct TSetUDPInfo {
+struct LoginRequest {
     header: TTEGHeader,
     udp_info: TUDPInfo,
     unknown_2: u8,
@@ -107,11 +110,11 @@ struct TSetUDPInfo {
 }
 
 
-impl TSetUDPInfo {
+impl LoginRequest {
     fn new(my_addr: &SocketAddr) -> Self
     {
         Self {
-            header: TTEGHeader::new(1, CMD_1TEG_SET_UDP_INFO, 40),
+            header: TTEGHeader::new(1, CMD_1TEG_LOGIN_REQUEST, 40),
             udp_info: TUDPInfo::new(my_addr),
             unknown_2: 9,
             password_hash: *b"9e8040834b3a",
@@ -122,17 +125,17 @@ impl TSetUDPInfo {
 
 
 #[derive(Debug, PartialEq, DekuRead, DekuWrite)]
-struct TGetUDPInfoPkt {
+struct PortRequest {
     header: TTEGHeader, // data_len == 12
     unknown_1: u16, // must be 0x01
     pad: [u8; 10]
 }
 
 
-impl TGetUDPInfoPkt {
+impl PortRequest {
     fn new() -> Self {
         Self {
-            header: TTEGHeader::new(1, CMD_1TEG_GET_UDP_INFO, 12),
+            header: TTEGHeader::new(1, CMD_1TEG_PORT_REQUEST, 12),
             unknown_1: 0x01,
             pad: [0; 10]
         }
@@ -197,14 +200,14 @@ impl ControlCommand {
 
 
 #[derive(Default, Debug, PartialEq, DekuRead, DekuWrite)]
-struct DataFrame {
+struct MediaFrame {
     header: TTEGHeader, // sig=2teg, cmd=0x03, data_len=..
     unknown_0: u32,  // 01 00 00 00
     unknown_1: u16,  // 01 00
     is_audio: u16,  // 00 00 = video,  01 00 = audio
     frame_index: u16,
     pkt_index: u16,
-    image_data_len: u32,
+    media_data_len: u32,
 }
 
 
@@ -219,12 +222,7 @@ fn now() -> u64 {
 
 fn hex2(buf: &[u8]) -> String
 {
-    let mut s = String::new();
-    for i in buf {
-        use std::fmt::Write;
-        write!(&mut s, "{:02x}", i).expect("could not write");
-    }
-    s
+    buf.into_iter().map(|c| format!("{:02x}", c)).collect()
 }
 
 
@@ -260,8 +258,8 @@ impl FrameBuilder {
 
 
 enum Frame {
-    UdpInfoResp(TGetUDPInfo),
-    ImageData(DataFrame),
+    PortResponse(PortResponse),
+    MediaFrame(MediaFrame),
     Unknown(TTEGHeader),
 }
 
@@ -269,8 +267,8 @@ enum Frame {
 fn parse_frame(buf: &[u8]) -> Result<Frame, std::io::Error> {
     let (_, header) = TTEGHeader::from_bytes((buf, 0))?;
     Ok(match (header.version(), header.cmd) {
-        (1, CMD_1TEG_UDP_INFO_RESP) => Frame::UdpInfoResp(from_bytes(buf)?),
-        (2, CMD_2TEG_IMAGE_DATA) => Frame::ImageData(from_bytes(buf)?),
+        (1, CMD_1TEG_PORT_RESPONSE) => Frame::PortResponse(from_bytes(buf)?),
+        (2, CMD_2TEG_MEDIA_FRAME) => Frame::MediaFrame(from_bytes(buf)?),
         _ => Frame::Unknown(header),
     })
 }
@@ -288,7 +286,6 @@ where
 }
 
 
-//const MAYBE_AUDIO: &[u8] = &hex!("3254454701001400010000000f000000020000000000000000000000");
 const MAYBE_AUDIO: &[u8] = &[
     0x32, 0x54, 0x45, 0x47, 0x01, 0x00, 0x1c, 0x00,
     0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -298,32 +295,29 @@ const MAYBE_AUDIO: &[u8] = &[
 ];
 
 
-async fn camera_main(
-    dst_addr: String,
-    video_tx: tokio::sync::broadcast::Sender<Vec<u8>>,
-    audio_tx: tokio::sync::broadcast::Sender<Vec<u8>>,
-)
+async fn camera_main(dst_addr: String,
+                     video_tx: Sender<Vec<u8>>,
+                     audio_tx: Sender<Vec<u8>>)
     -> Result<(), std::io::Error>
 {
     let sock = UdpSocket::bind("0.0.0.0:0").await?;
     sock.connect((dst_addr.as_str(), 10104)).await?;
-    sock.send(&TGetUDPInfoPkt::new().to_bytes()?).await?;
+    sock.send(&PortRequest::new().to_bytes()?).await?;
 
     let mut buf = [0; 4096];
-
     timeout_ms(1000, sock.recv(&mut buf)).await??;
 
-    let udp_info: TGetUDPInfo = from_bytes(&buf)?;
-    eprintln!("{:?}", udp_info);
+    let port_resp: PortResponse = from_bytes(&buf)?;
+    eprintln!("{:?}", port_resp);
 
-    sock.connect((dst_addr.as_str(), udp_info.udp_info.udp_port)).await?;
+    sock.connect((dst_addr.as_str(), port_resp.udp_info.udp_port)).await?;
 
     let my_addr = sock.local_addr()?;
-    sock.send(&TSetUDPInfo::new(&my_addr).to_bytes()?).await?;
+    sock.send(&LoginRequest::new(&my_addr).to_bytes()?).await?;
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    sock.send(&TSetUDPInfo::new(&my_addr).to_bytes()?).await?;
+    sock.send(&LoginRequest::new(&my_addr).to_bytes()?).await?;
 
-    let sizeof_data_frame = sizeof::<DataFrame>();
+    let sizeof_media_frame = sizeof::<MediaFrame>();
 
     let mut start_time = 0;
     let mut frames_received = 0;
@@ -354,32 +348,33 @@ async fn camera_main(
                           header.version(), header.cmd,
                           header.data_len, hex2(&buf[..len]));
             }
-            Frame::UdpInfoResp(_) => {},
-            Frame::ImageData(idata) => {
-                eprintln!("Recv Video frame={}, pkt={}, len={}, is_audio={}",
-                          idata.frame_index,
-                          idata.pkt_index,
-                          idata.image_data_len,
-                          idata.is_audio);
+            Frame::PortResponse(_) => {},
+            Frame::MediaFrame(mframe) => {
+                eprintln!("Recv MediaFrame idx={}, pkt={}, len={}, is_audio={}",
+                          mframe.frame_index,
+                          mframe.pkt_index,
+                          mframe.media_data_len,
+                          mframe.is_audio);
 
-                if idata.pkt_index == 0 {
-                    if idata.is_audio == 1 {
-                        let start = (idata.header.data_len as usize - 16 - idata.image_data_len as usize) + sizeof_data_frame;
-                        let v = &buf[start..start+idata.image_data_len as usize];
-                        let vlen = v.len();
-                        let subcount = audio_tx.send(v.to_vec()).unwrap_or(0);
-                        if subcount > 0 {
-                            eprintln!("published {} byte audio frame to {} subscribers", vlen, subcount);
-                        }
-                        continue;
+                let start = (mframe.header.data_len as usize - 16 - mframe.media_data_len as usize) + sizeof_media_frame;
+                let payload = &buf[start..start+mframe.media_data_len as usize];
+
+                if mframe.is_audio == 1 {
+                    assert!(mframe.pkt_index == 0);
+                    let subcount = audio_tx.send(payload.to_vec()).unwrap_or(0);
+                    if subcount > 0 {
+                        eprintln!("published {} byte audio frame to {} subscribers", payload.len(), subcount);
                     }
+                    continue;
+                }
 
+                if mframe.pkt_index == 0 {
                     match builder.finalize() {
                         None => {
                             eprintln!("dropped frame");
                             frames_dropped += 1;
                         },
-                        Some(v) => {
+                        Some(built) => {
                             // emit
                             frames_received += 1;
                             if start_time == 0 {
@@ -394,51 +389,59 @@ async fn camera_main(
                                           (frames_dropped+frames_received) as f64 / secs,
                                           frames_dropped, frames_received);
                             }
-                            let vlen = v.len();
-                            let subcount = video_tx.send(v).unwrap_or(0);
+                            let built_len = built.len();
+                            let subcount = video_tx.send(built).unwrap_or(0);
                             if subcount > 0 {
-                                eprintln!("published {} byte video frame to {} subscribers", vlen, subcount);
+                                eprintln!("published {} byte video frame to {} subscribers", built_len, subcount);
                             }
                         }
                     }
                 }
 
-                let start = (idata.header.data_len as usize - 16 - idata.image_data_len as usize) + sizeof_data_frame;
-                let rem = &buf[start..start+idata.image_data_len as usize];
-                builder.add_piece(idata.pkt_index, rem);
+                builder.add_piece(mframe.pkt_index, payload);
             },
         }
     }
 }
 
 
-async fn web_main(
-    video_tx: tokio::sync::broadcast::Sender<Vec<u8>>,
-    audio_tx: tokio::sync::broadcast::Sender<Vec<u8>>
-)
+async fn index()
+    -> axum::response::Html<&'static str>
+{
+    axum::response::Html(include_str!("index.html"))
+}
+
+
+async fn audio_stream(audio_tx: Sender<Vec<u8>>)
+    -> axum::response::Response<axum::body::Body>
+{
+    axum::response::Response::builder()
+        .status(200)
+        .header("Content-Type", "audio/x-ima-adpcm")
+        .body(Body::from_stream(BroadcastStream::new(audio_tx.subscribe())))
+        .unwrap()
+}
+
+
+async fn cam_stream(video_tx: Sender<Vec<u8>>)
+    -> axum::response::Response<axum::body::Body>
+{
+    axum::response::Response::builder()
+        .status(200)
+        .header("Content-Type", "video/x-motion-jpeg")
+        .body(Body::from_stream(BroadcastStream::new(video_tx.subscribe())))
+        .unwrap()
+}
+
+
+async fn web_main(video_tx: Sender<Vec<u8>>, audio_tx: Sender<Vec<u8>>)
     -> Result<(), std::io::Error>
 {
-    use axum::body::Body;
-    use tokio_stream::wrappers::BroadcastStream;
-
+    use axum::routing::get;
     let app = axum::Router::new()
-        .route("/", axum::routing::get(|| async {
-            axum::response::Html(include_str!("index.html"))
-        }))
-        .route("/audio", axum::routing::get(|| async move {
-            axum::response::Response::builder()
-                .status(200)
-                .header("Content-Type", "audio/x-ima-adpcm")
-                .body(Body::from_stream(BroadcastStream::new(audio_tx.subscribe())))
-                .unwrap()
-        }))
-        .route("/cam", axum::routing::get(|| async move {
-            axum::response::Response::builder()
-                .status(200)
-                .header("Content-Type", "video/x-motion-jpeg")
-                .body(Body::from_stream(BroadcastStream::new(video_tx.subscribe())))
-                .unwrap()
-        }));
+        .route("/", get(|| index()))
+        .route("/audio", get(move || audio_stream(audio_tx)))
+        .route("/cam", get(move || cam_stream(video_tx)));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
         .await
