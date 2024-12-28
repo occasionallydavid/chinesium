@@ -1,7 +1,12 @@
-use deku::prelude::*;
 use axum::body::Body;
+use deku::prelude::*;
+use futures::stream::Stream;
 use std::net::IpAddr;
 use std::net::SocketAddr;
+use std::ops::DerefMut;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::net::UdpSocket;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio::sync::broadcast::Sender;
@@ -297,7 +302,8 @@ const MAYBE_AUDIO: &[u8] = &[
 
 async fn camera_main(dst_addr: String,
                      video_tx: Sender<Vec<u8>>,
-                     audio_tx: Sender<Vec<u8>>)
+                     audio_tx: Sender<Vec<u8>>,
+                     video_last: Arc<Mutex<Vec<u8>>>)
     -> Result<(), std::io::Error>
 {
     let sock = UdpSocket::bind("0.0.0.0:0").await?;
@@ -389,7 +395,10 @@ async fn camera_main(dst_addr: String,
                                           (frames_dropped+frames_received) as f64 / secs,
                                           frames_dropped, frames_received);
                             }
+
                             let built_len = built.len();
+                            *video_last.lock().unwrap().deref_mut() = built.clone();
+
                             let subcount = video_tx.send(built).unwrap_or(0);
                             if subcount > 0 {
                                 eprintln!("published {} byte video frame to {} subscribers", built_len, subcount);
@@ -423,25 +432,33 @@ async fn audio_stream(audio_tx: Sender<Vec<u8>>)
 }
 
 
-async fn cam_stream(video_tx: Sender<Vec<u8>>)
+async fn cam_stream(video_tx: Sender<Vec<u8>>, video_last: Arc<Mutex<Vec<u8>>>)
     -> axum::response::Response<axum::body::Body>
 {
+    let both: Vec<Pin<Box<dyn Stream<Item = _> + Send>>> = vec![
+        Box::pin(futures::stream::once(async move {
+            Ok((*video_last.lock().unwrap()).clone())
+        })),
+        Box::pin(BroadcastStream::new(video_tx.subscribe())),
+    ];
+
     axum::response::Response::builder()
         .status(200)
         .header("Content-Type", "video/x-motion-jpeg")
-        .body(Body::from_stream(BroadcastStream::new(video_tx.subscribe())))
+        .body(Body::from_stream(futures::stream::select_all(both)))
         .unwrap()
 }
 
 
-async fn web_main(video_tx: Sender<Vec<u8>>, audio_tx: Sender<Vec<u8>>)
+async fn web_main(video_tx: Sender<Vec<u8>>, audio_tx: Sender<Vec<u8>>,
+                  video_last: Arc<Mutex<Vec<u8>>>)
     -> Result<(), std::io::Error>
 {
     use axum::routing::get;
     let app = axum::Router::new()
         .route("/", get(|| index()))
         .route("/audio", get(move || audio_stream(audio_tx)))
-        .route("/cam", get(move || cam_stream(video_tx)));
+        .route("/cam", get(move || cam_stream(video_tx, video_last)));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
         .await
@@ -463,13 +480,15 @@ async fn main() -> Result<(), std::io::Error> {
     let dst_addr = args[1].as_str();
     let (video_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(40);
     let (audio_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(40);
+    let video_last: Arc<Mutex<Vec<u8>>> = Default::default();
 
     let cam_main = tokio::spawn(
         camera_main(dst_addr.to_string(),
                     video_tx.clone(),
-                    audio_tx.clone()));
+                    audio_tx.clone(),
+                    video_last.clone()));
     let web_main = tokio::spawn(
-        web_main(video_tx.clone(), audio_tx.clone())
+        web_main(video_tx.clone(), audio_tx.clone(), video_last.clone())
     );
     cam_main.await?.unwrap();
     web_main.await?
