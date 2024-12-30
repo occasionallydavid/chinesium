@@ -469,6 +469,38 @@ async fn web_main(video_tx: Sender<Bytes>, audio_tx: Sender<Bytes>,
 }
 
 
+async fn writer(video_tx: Sender<Bytes>)
+    -> Result<(), std::io::Error>
+{
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = tokio::process::Command::new("ffmpeg")
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::piped())
+        .args(["-probesize", "32"])
+        .args(["-flags", "low_delay"])
+        .args(["-i", "-"])
+        .args(["-fflags", "nobuffer"])
+        .args(["-c", "copy"])
+        .args(["-f", "segment"])
+        .args(["-segment_time", "900"])
+        .args(["-segment_atclocktime", "1"])
+        .args(["-strftime", "1"])
+        .args(["/home/dmw/logs/hallcam-%Y-%m-%d_%H-%M-%S.mkv"])
+        .spawn()
+        .expect("ffmpeg failed to start");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let mut sub = video_tx.subscribe();
+    loop {
+        let frame = sub.recv().await.expect("could nto get frame");
+        println!("ffmpeg write frame {} len", frame.len());
+        stdin.write(&frame).await;
+        stdin.flush().await;
+    }
+}
+
+
 #[tokio::main(flavor="current_thread")]
 async fn main() -> Result<(), std::io::Error> {
     let args: Vec<_> = std::env::args().collect();
@@ -482,14 +514,32 @@ async fn main() -> Result<(), std::io::Error> {
     let (audio_tx, _) = tokio::sync::broadcast::channel::<Bytes>(40);
     let video_last: Arc<Mutex<Bytes>> = Default::default();
 
-    let cam_main = tokio::spawn(
+    let mut cam_main = tokio::spawn(
         camera_main(dst_addr.to_string(),
                     video_tx.clone(),
                     audio_tx.clone(),
                     video_last.clone()));
-    let web_main = tokio::spawn(
+
+    let mut web_main = tokio::spawn(
         web_main(video_tx.clone(), audio_tx.clone(), video_last.clone())
     );
-    cam_main.await?.unwrap();
-    web_main.await?
+
+    let mut writer_main = tokio::spawn(writer(video_tx.clone()));
+
+    tokio::select! {
+        rv_web = (&mut web_main) => {
+            eprintln!("web exit {:?}", rv_web);
+        },
+        rv_writer = (&mut writer_main) => {
+            eprintln!("writer exit {:?}", rv_writer);
+        },
+        rv_cam = (&mut cam_main) => {
+            eprintln!("cam exit {:?}", rv_cam);
+        }
+    }
+
+    web_main.abort();
+    writer_main.abort();
+    cam_main.abort();
+    Ok(())
 }
